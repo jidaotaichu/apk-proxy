@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""v3: 完整浏览器 headers + JSON 解析 + wayback + apkmirror"""
+"""v4: 专攻 binance - CDN 探测 + wayback + 镜像 + evozi"""
 import urllib.request, re, sys, os, zipfile, json, html as htmlmod
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 HDR = {
     "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "identity",
-    "Referer": "https://www.google.com/",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "cross-site",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Site": "none",
     "Connection": "close",
 }
 OUTDIR = "apks"
 os.makedirs(OUTDIR, exist_ok=True)
 
-def get(url, timeout=90, raw=False):
+def get(url, timeout=60):
     req = urllib.request.Request(url, headers=HDR)
     r = urllib.request.urlopen(req, timeout=timeout)
-    return r.read() if raw else r.read().decode("utf-8", "ignore")
+    return r.read().decode("utf-8", "ignore")
+
+def head(url, timeout=30):
+    try:
+        req = urllib.request.Request(url, headers=HDR, method="HEAD")
+        r = urllib.request.urlopen(req, timeout=timeout)
+        return r.status, dict(r.headers)
+    except Exception as e:
+        return getattr(e, "code", None), repr(e)[:80]
 
 def norm(s):
     return htmlmod.unescape(s).replace("\\u002F", "/").replace("\\/", "/")
@@ -36,39 +38,17 @@ def apk_links(text):
     links = set()
     for m in re.finditer(r'https?://[^\s"\'<>\\]+\.(?:apk|xapk)(?:\?[^\s"\'<>\\]*)?', text):
         links.add(norm(m.group(0)))
-    for m in re.finditer(r'https?:\\/\\/[^\s"\'<>\\]+\.(?:apk|xapk)', text):
-        links.add(norm(m.group(0)))
-    # JSON 里的 "url":"...apk"
     for m in re.finditer(r'"url"\s*:\s*"(https?[^"]+\.(?:apk|xapk)[^"]*)"', text):
         links.add(norm(m.group(1)))
     return links
 
-def pick(links, pats):
-    for l in links:
-        if any(p in l.lower() for p in pats):
-            return l
-    return None
-
-def try_page(url, pats, debug=False):
-    try:
-        html = get(url)
-    except Exception as e:
-        print("  [page err]", url, repr(e)[:100], flush=True)
-        return None
-    links = apk_links(html)
-    if debug:
-        print("  [page]", url, "html_len=", len(html), "links=", len(links), flush=True)
-        for l in list(links)[:4]:
-            print("     ", l[:160], flush=True)
-    return pick(links, pats)
-
-def dl(url, out, referer=None):
+def dl(url, out, referer=None, timeout=300):
     h = dict(HDR)
     if referer:
         h["Referer"] = referer
     try:
         req = urllib.request.Request(url, headers=h)
-        data = urllib.request.urlopen(req, timeout=300).read()
+        data = urllib.request.urlopen(req, timeout=timeout).read()
     except Exception as e:
         print("  [dl err]", repr(e)[:120], flush=True)
         return False
@@ -85,49 +65,77 @@ def dl(url, out, referer=None):
     print("  saved", out, size, "bytes |", ok, flush=True)
     return size > 100000 and ok.startswith("zip-OK")
 
-def fetch(name, candidates, out):
-    print("== fetch", name, flush=True)
-    for src, url in candidates:
-        u = try_page(url, [name.lower(), "binance", "okx", "okex", "okinc", "apk"], debug=True)
-        if u:
-            print("  chosen:", u[:180], flush=True)
-            if dl(u, out, referer=url):
-                return True
-            print("  dl failed, next", flush=True)
-        else:
-            print("  no link from", src, flush=True)
-    print("  FAILED", name, flush=True)
-    return False
+# --- 0. OKX 已知直链 ---
+print("== 0. okx known link ==", flush=True)
+if dl("https://static.okx.com/upgradeapp/android.apk", os.path.join(OUTDIR, "okx.apk"), referer="https://www.okx.com/en/download"):
+    print("OKX_OK", flush=True)
+else:
+    print("OKX_FAIL", flush=True)
 
-# OKX: 官方页 HTML 里搜 json 下载链接
-print("== okx json scan ==", flush=True)
+# --- 1. CDN 域名探测 ---
+print("== 1. cdn probe ==", flush=True)
+for d in ["https://download.binance.com", "https://static.binance.com",
+          "https://bin.bnbstatic.com", "https://www.binance.com/en/download"]:
+    st, info = head(d)
+    print("  ", d, "->", st, flush=True)
+
+# --- 2. wayback 存档 ---
+print("== 2. wayback ==", flush=True)
 try:
-    h = get("https://www.okx.com/zh-hans/download")
-    for m in re.finditer(r'.{80}apk.{120}', h, re.I):
-        print("  ...", m.group(0)[:200], flush=True)
+    wb = json.loads(get("http://archive.org/wayback/available?url=www.binance.com/en/download&timestamp=2026"))
+    snap = wb.get("archived_snapshots", {}).get("closest", {}).get("url")
+    print("  snapshot:", snap, flush=True)
+    if snap:
+        html = get(snap.replace("http://", "https://"), timeout=90)
+        links = apk_links(html)
+        print("  links from snapshot:", len(links), flush=True)
+        for l in list(links)[:5]:
+            print("    ", l[:160], flush=True)
+            if ".apk" in l and "binance" in l.lower():
+                if dl(l, os.path.join(OUTDIR, "binance.apk"), referer=snap):
+                    print("BINANCE_OK_VIA_WAYBACK", flush=True)
 except Exception as e:
-    print("  okx err", e, flush=True)
+    print("  wayback err:", repr(e)[:150], flush=True)
 
-ok_all = True
-if not fetch("binance", [
-    ("official-en", "https://www.binance.com/en/download"),
-    ("official-zh", "https://www.binance.com/zh-CN/download"),
-    ("apkpure", "https://apkpure.com/binance/com.binance.dev"),
-    ("apkcombo", "https://apkcombo.com/binance/com.binance.dev/download/apk"),
-    ("apkmirror", "https://www.apkmirror.com/apk/binance/"),
-    ("apkfab", "https://apkfab.com/binance/com.binance.dev"),
-], os.path.join(OUTDIR, "binance.apk")):
-    ok_all = False
+# --- 3. 镜像站 ---
+print("== 3. mirrors ==", flush=True)
+for src, url in [
+    ("apk.support", "https://apk.support/app/com.binance.dev"),
+    ("apkhere", "https://apkhere.com/app/com.binance.dev"),
+    ("apkmonk", "https://www.apkmonk.com/app/com.binance.dev/"),
+    ("androidapksfree", "https://www.androidapksfree.com/apk/com-binance-dev-binance/"),
+    ("apkdl", "https://apkdl.in/app/details?id=com.binance.dev"),
+    ("apkcombo2", "https://apkcombo.com/binance/com.binance.dev/"),
+]:
+    try:
+        html = get(url)
+        links = apk_links(html)
+        print("  ", src, "len=", len(html), "links=", len(links), flush=True)
+        for l in list(links)[:3]:
+            print("     ", l[:150], flush=True)
+        if links:
+            for l in links:
+                if ".apk" in l.lower():
+                    if dl(l, os.path.join(OUTDIR, "binance.apk"), referer=url):
+                        print("BINANCE_OK_VIA_" + src, flush=True)
+                        break
+    except Exception as e:
+        print("  ", src, "err:", repr(e)[:100], flush=True)
 
-if not fetch("okx", [
-    ("official-en", "https://www.okx.com/en/download"),
-    ("official-zh", "https://www.okx.com/zh-hans/download"),
-    ("apkpure", "https://apkpure.com/okx/com.okinc.okex"),
-    ("apkcombo", "https://apkcombo.com/okx/com.okinc.okex/download/apk"),
-    ("apkmirror", "https://www.apkmirror.com/apk/okx/"),
-    ("apkfab", "https://apkfab.com/okx/com.okinc.okex"),
-], os.path.join(OUTDIR, "okx.apk")):
-    ok_all = False
+# --- 4. evozi (Google Play 下载器) ---
+print("== 4. evozi ==", flush=True)
+try:
+    ev = get("https://apps.evozi.com/apk-downloader/?id=com.binance.dev", timeout=90)
+    print("  evozi len:", len(ev), flush=True)
+    m = re.search(r'https?://[^"\']+\.apk[^"\']*', ev)
+    if m:
+        print("  evozi link:", m.group(0)[:160], flush=True)
+        if dl(m.group(0), os.path.join(OUTDIR, "binance.apk"), referer="https://apps.evozi.com/apk-downloader/"):
+            print("BINANCE_OK_VIA_EVOZI", flush=True)
+    else:
+        print("  no apk link in evozi page", flush=True)
+        print("  page sample:", ev[:400], flush=True)
+except Exception as e:
+    print("  evozi err:", repr(e)[:150], flush=True)
 
-print("ALL_OK" if ok_all else "PARTIAL", flush=True)
-sys.exit(0 if ok_all else 1)
+print("DONE", flush=True)
