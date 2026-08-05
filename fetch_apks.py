@@ -1,95 +1,101 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""v6: binance playwright - 分步点击 + network 监听 + dump 页面"""
-import os, sys, zipfile, json
+"""v7: wayback CDX 找 binance/okx APK 存档并下载 + bapi 探测"""
+import urllib.request, re, sys, os, zipfile, json
 
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 OUTDIR = "apks"
 os.makedirs(OUTDIR, exist_ok=True)
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-from playwright.sync_api import sync_playwright
+def get(url, timeout=90, referer=None):
+    h = {"User-Agent": UA, "Accept-Encoding": "identity"}
+    if referer:
+        h["Referer"] = referer
+    req = urllib.request.Request(url, headers=h)
+    return urllib.request.urlopen(req, timeout=timeout).read()
 
-with sync_playwright() as p:
-    b = p.chromium.launch(headless=False, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
-    ctx = b.new_context(user_agent=UA, accept_downloads=True, locale="en-US", viewport={"width": 1366, "height": 900})
-    page = ctx.new_page()
-
-    apk_urls = []
-    def on_response(resp):
-        try:
-            u = resp.url
-            if "apk" in u.lower() or "download" in u.lower():
-                ct = resp.headers.get("content-type", "")
-                if "json" in ct or "apk" in u.lower():
-                    apk_urls.append(u)
-                    print("  [net]", u[:200], ct[:40], flush=True)
-        except Exception:
-            pass
-    page.on("response", on_response)
-
+def check(fn):
+    if not os.path.exists(fn):
+        return False
+    size = os.path.getsize(fn)
+    ok = "?"
     try:
-        page.goto("https://www.binance.com/en/download", timeout=90000, wait_until="domcontentloaded")
-        # 等 Cloudflare 挑战
-        for i in range(6):
-            page.wait_for_timeout(10000)
-            t = page.title()
-            print("  wait", (i+1)*10, "s title:", t, flush=True)
-            if "binance" in t.lower() or "币安" in t:
-                break
-        print("  final title:", page.title(), flush=True)
-
-        # dump 所有可见按钮和链接文本
-        info = page.evaluate("""() => {
-            const out = {btns: [], links: []};
-            document.querySelectorAll('button, a').forEach(e => {
-                const t = (e.innerText||'').trim().slice(0,50);
-                if (t && (e.tagName==='BUTTON' || e.href)) {
-                    if (e.tagName==='BUTTON') out.btns.push(t);
-                    else out.links.push(t + ' => ' + e.href.slice(0,120));
-                }
-            });
-            return out;
-        }""")
-        print("  BUTTONS:", json.dumps(info["btns"][:30], ensure_ascii=False), flush=True)
-        print("  LINKS:", json.dumps(info["links"][:30], ensure_ascii=False), flush=True)
-
-        # 尝试分步点击: Download -> Android -> APK
-        for pat in [["download"], ["android", "apk"], ["apk"]]:
-            try:
-                with page.expect_download(timeout=15000) as dl_info:
-                    clicked = page.evaluate("""(pats) => {
-                        const els = [...document.querySelectorAll('button,a')];
-                        for (const e of els) {
-                            const t = (e.innerText||'').toLowerCase().trim();
-                            if (t && pats.some(p => t.includes(p))) { e.click(); return t.slice(0,50); }
-                        }
-                        return null;
-                    }""", pat)
-                    if not clicked:
-                        print("  no element for", pat, flush=True)
-                        continue
-                dl = dl_info.value
-                dl.save_as(os.path.join(OUTDIR, "binance.apk"))
-                print("  CAPTURED via", clicked, dl.suggested_filename, flush=True)
-                break
-            except Exception as e:
-                print("  click", pat, "err:", repr(e)[:80], flush=True)
-
-        # 检查页面里所有含 apk 的 URL
-        urls = page.evaluate("""() => {
-            const s = document.documentElement.outerHTML;
-            const m = s.match(/https?:\\/\\/[^\"'\\s]+\\.apk[^\"'\\s]*/g) || [];
-            return m.slice(0,10);
-        }""")
-        print("  apk urls in html:", urls, flush=True)
+        z = zipfile.ZipFile(fn)
+        bad = z.testzip()
+        ok = "zip-OK" if bad is None else "ZIP-BAD:" + str(bad)
     except Exception as e:
-        print("  binance err:", repr(e)[:200], flush=True)
+        ok = "not-zip:" + str(e)
+    print("  ", fn, size, ok, flush=True)
+    return size > 100000 and ok.startswith("zip-OK")
 
-    print("  network apk urls:", apk_urls[:10], flush=True)
-    b.close()
+def cdx_find(domain, pat, limit=40):
+    url = ("http://web.archive.org/cdx/search/cdx?url=%s*&filter=urlkey:.*%s.*&limit=%d"
+           "&output=json&collapse=urlkey&fl=original,timestamp,statuscode,length&filter=statuscode:200" % (domain, pat, limit))
+    try:
+        data = get(url, timeout=90).decode("utf-8", "ignore")
+        rows = json.loads(data)
+        return rows[1:] if len(rows) > 1 else []
+    except Exception as e:
+        print("  cdx err:", repr(e)[:120], flush=True)
+        return []
 
-fn = os.path.join(OUTDIR, "binance.apk")
-if os.path.exists(fn):
-    print("  size:", os.path.getsize(fn), flush=True)
-print("DONE", flush=True)
+def dl_wayback(original, ts, out):
+    u = "https://web.archive.org/web/%sid_/%s" % (ts, original)
+    try:
+        data = get(u, timeout=600)
+        open(out, "wb").write(data)
+        print("  wayback dl:", original, ts, len(data), flush=True)
+        return True
+    except Exception as e:
+        print("  wayback dl err:", repr(e)[:120], flush=True)
+        return False
+
+ok_all = True
+
+# ---- Binance ----
+print("== binance cdx ==", flush=True)
+rows = cdx_find("binance.com", r"\.apk")
+for r in rows[:20]:
+    print("  ", r, flush=True)
+bin_done = False
+for r in rows:
+    if not bin_done and ".apk" in r[0]:
+        if dl_wayback(r[0], r[1], os.path.join(OUTDIR, "binance.apk")):
+            bin_done = check(os.path.join(OUTDIR, "binance.apk"))
+if not bin_done:
+    ok_all = False
+    print("  binance wayback failed, try bapi", flush=True)
+    # bapi 探测
+    for ep in [
+        "https://www.binance.com/bapi/asset/v2/public/asset-service/product/download-center/list",
+        "https://www.binance.com/bapi/asset/v2/public/asset-service/product/download-center?type=android",
+        "https://www.binance.com/gateway-api/v1/public/asset-service/product/download-center/list",
+    ]:
+        try:
+            d = get(ep, timeout=30)
+            print("  bapi", ep[:80], "->", len(d), d[:200], flush=True)
+        except Exception as e:
+            print("  bapi", ep[:80], "err", repr(e)[:80], flush=True)
+
+# ---- OKX ----
+print("== okx ==", flush=True)
+if not check(os.path.join(OUTDIR, "okx.apk")):
+    try:
+        data = get("https://static.okx.com/upgradeapp/android.apk", timeout=600)
+        open(os.path.join(OUTDIR, "okx.apk"), "wb").write(data)
+        print("  okx downloaded", len(data), flush=True)
+    except Exception as e:
+        print("  okx err:", repr(e)[:120], flush=True)
+        rows = cdx_find("okx.com", r"\.apk")
+        for r in rows[:10]:
+            print("  okx cdx:", r, flush=True)
+        for r in rows:
+            if ".apk" in r[0]:
+                if dl_wayback(r[0], r[1], os.path.join(OUTDIR, "okx.apk")):
+                    break
+    check(os.path.join(OUTDIR, "okx.apk"))
+
+bin_ok = check(os.path.join(OUTDIR, "binance.apk"))
+okx_ok = check(os.path.join(OUTDIR, "okx.apk"))
+print("RESULT binance=%s okx=%s" % (bin_ok, okx_ok), flush=True)
+sys.exit(0 if (bin_ok and okx_ok) else 1)
