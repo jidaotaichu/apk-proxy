@@ -1,117 +1,95 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""v5: okx 直链 + binance 用 playwright 真实浏览器过 Cloudflare 抓 APK"""
-import os, sys, zipfile, urllib.request
+"""v6: binance playwright - 分步点击 + network 监听 + dump 页面"""
+import os, sys, zipfile, json
 
 OUTDIR = "apks"
 os.makedirs(OUTDIR, exist_ok=True)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-def check(fn):
-    if not os.path.exists(fn):
-        return False
-    size = os.path.getsize(fn)
-    ok = "?"
-    try:
-        z = zipfile.ZipFile(fn)
-        bad = z.testzip()
-        ok = "zip-OK" if bad is None else "ZIP-BAD:" + str(bad)
-    except Exception as e:
-        ok = "not-zip:" + str(e)
-    print("  ", fn, size, ok, flush=True)
-    return size > 100000 and ok.startswith("zip-OK")
-
-# ---- OKX 直链 ----
-print("== okx ==", flush=True)
-try:
-    req = urllib.request.Request("https://static.okx.com/upgradeapp/android.apk",
-                                 headers={"User-Agent": UA})
-    data = urllib.request.urlopen(req, timeout=600).read()
-    open(os.path.join(OUTDIR, "okx.apk"), "wb").write(data)
-    print("  okx downloaded", len(data), flush=True)
-    check(os.path.join(OUTDIR, "okx.apk"))
-except Exception as e:
-    print("  okx err:", repr(e)[:150], flush=True)
-
-# ---- Binance: playwright ----
-print("== binance playwright ==", flush=True)
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError as e:
-    print("  playwright not installed:", e, flush=True)
-    sys.exit(1)
+from playwright.sync_api import sync_playwright
 
 with sync_playwright() as p:
     b = p.chromium.launch(headless=False, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
     ctx = b.new_context(user_agent=UA, accept_downloads=True, locale="en-US", viewport={"width": 1366, "height": 900})
     page = ctx.new_page()
 
-    def click_and_capture(patterns, outfile, tries=12):
-        for i in range(tries):
+    apk_urls = []
+    def on_response(resp):
+        try:
+            u = resp.url
+            if "apk" in u.lower() or "download" in u.lower():
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct or "apk" in u.lower():
+                    apk_urls.append(u)
+                    print("  [net]", u[:200], ct[:40], flush=True)
+        except Exception:
+            pass
+    page.on("response", on_response)
+
+    try:
+        page.goto("https://www.binance.com/en/download", timeout=90000, wait_until="domcontentloaded")
+        # 等 Cloudflare 挑战
+        for i in range(6):
+            page.wait_for_timeout(10000)
+            t = page.title()
+            print("  wait", (i+1)*10, "s title:", t, flush=True)
+            if "binance" in t.lower() or "币安" in t:
+                break
+        print("  final title:", page.title(), flush=True)
+
+        # dump 所有可见按钮和链接文本
+        info = page.evaluate("""() => {
+            const out = {btns: [], links: []};
+            document.querySelectorAll('button, a').forEach(e => {
+                const t = (e.innerText||'').trim().slice(0,50);
+                if (t && (e.tagName==='BUTTON' || e.href)) {
+                    if (e.tagName==='BUTTON') out.btns.push(t);
+                    else out.links.push(t + ' => ' + e.href.slice(0,120));
+                }
+            });
+            return out;
+        }""")
+        print("  BUTTONS:", json.dumps(info["btns"][:30], ensure_ascii=False), flush=True)
+        print("  LINKS:", json.dumps(info["links"][:30], ensure_ascii=False), flush=True)
+
+        # 尝试分步点击: Download -> Android -> APK
+        for pat in [["download"], ["android", "apk"], ["apk"]]:
             try:
-                with page.expect_download(timeout=12000) as dl_info:
+                with page.expect_download(timeout=15000) as dl_info:
                     clicked = page.evaluate("""(pats) => {
-                        const els = [...document.querySelectorAll('a,button')];
+                        const els = [...document.querySelectorAll('button,a')];
                         for (const e of els) {
                             const t = (e.innerText||'').toLowerCase().trim();
                             if (t && pats.some(p => t.includes(p))) { e.click(); return t.slice(0,50); }
                         }
                         return null;
-                    }""", patterns)
+                    }""", pat)
                     if not clicked:
-                        print("  no clickable element, break", flush=True)
-                        return False
+                        print("  no element for", pat, flush=True)
+                        continue
                 dl = dl_info.value
-                dl.save_as(outfile)
-                print("  captured:", dl.suggested_filename, "via", clicked, flush=True)
-                return True
+                dl.save_as(os.path.join(OUTDIR, "binance.apk"))
+                print("  CAPTURED via", clicked, dl.suggested_filename, flush=True)
+                break
             except Exception as e:
-                print("  attempt", i, repr(e)[:90], flush=True)
-        return False
+                print("  click", pat, "err:", repr(e)[:80], flush=True)
 
-    # 1) binance 官方站
-    try:
-        page.goto("https://www.binance.com/en/download", timeout=60000, wait_until="domcontentloaded")
-        page.wait_for_timeout(15000)
-        print("  binance title:", page.title(), flush=True)
-        if not click_and_capture(["download apk", "download for android", "android apk"], os.path.join(OUTDIR, "binance.apk")):
-            links = page.eval_on_selector_all("a", "els => els.map(e=>e.href).filter(h=>h && h.includes('.apk'))")
-            print("  href apk links:", links[:5], flush=True)
-            if links:
-                try:
-                    req = urllib.request.Request(links[0], headers={"User-Agent": UA})
-                    data = urllib.request.urlopen(req, timeout=300).read()
-                    open(os.path.join(OUTDIR, "binance.apk"), "wb").write(data)
-                    print("  downloaded from href", flush=True)
-                except Exception as e:
-                    print("  href dl err:", repr(e)[:100], flush=True)
+        # 检查页面里所有含 apk 的 URL
+        urls = page.evaluate("""() => {
+            const s = document.documentElement.outerHTML;
+            const m = s.match(/https?:\\/\\/[^\"'\\s]+\\.apk[^\"'\\s]*/g) || [];
+            return m.slice(0,10);
+        }""")
+        print("  apk urls in html:", urls, flush=True)
     except Exception as e:
-        print("  binance page err:", repr(e)[:150], flush=True)
+        print("  binance err:", repr(e)[:200], flush=True)
 
-    # 2) apkpure fallback
-    if not check(os.path.join(OUTDIR, "binance.apk")):
-        print("  fallback apkpure", flush=True)
-        try:
-            page.goto("https://apkpure.com/binance/com.binance.dev", timeout=60000, wait_until="domcontentloaded")
-            page.wait_for_timeout(10000)
-            print("  apkpure title:", page.title(), flush=True)
-            if not click_and_capture(["download apk", "download"], os.path.join(OUTDIR, "binance.apk")):
-                links = page.eval_on_selector_all("a", "els => els.map(e=>e.href).filter(h=>h && (h.includes('.apk')||h.includes('cdnpure')))")
-                print("  apkpure links:", links[:5], flush=True)
-                if links:
-                    try:
-                        req = urllib.request.Request(links[0], headers={"User-Agent": UA, "Referer": "https://apkpure.com/"})
-                        data = urllib.request.urlopen(req, timeout=300).read()
-                        open(os.path.join(OUTDIR, "binance.apk"), "wb").write(data)
-                        print("  apkpure downloaded from href", flush=True)
-                    except Exception as e:
-                        print("  apkpure href dl err:", repr(e)[:100], flush=True)
-        except Exception as e:
-            print("  apkpure err:", repr(e)[:150], flush=True)
-
+    print("  network apk urls:", apk_urls[:10], flush=True)
     b.close()
 
-ok = check(os.path.join(OUTDIR, "binance.apk")) and check(os.path.join(OUTDIR, "okx.apk"))
-print("ALL_OK" if ok else "PARTIAL", flush=True)
-sys.exit(0 if ok else 1)
+fn = os.path.join(OUTDIR, "binance.apk")
+if os.path.exists(fn):
+    print("  size:", os.path.getsize(fn), flush=True)
+print("DONE", flush=True)
