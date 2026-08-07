@@ -23,6 +23,10 @@ jobs:
       - name: Run fetch script
         run: xvfb-run -a python3 fetch_apks.py || true
 
+      - name: Fetch etherfi via APKPure API
+        run: |
+          python3 fetch_etherfi.py || true
+
       - name: Upload release
         if: always()
         env:
